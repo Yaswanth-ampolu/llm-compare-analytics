@@ -1,37 +1,26 @@
-import { OpenAIService } from './openai-service';
-import { AnthropicService } from './anthropic-service';
 import { OllamaService } from './ollama-service';
-import { GGUFService } from './gguf-service';
 import {
   ProviderConfigs,
   ComparisonResult,
   ModelResponse,
+  ModelMetrics,
+  OllamaEndpointConfig,
 } from '../types/model-config';
+import { browserLog } from '@/lib/utils/logger';
 
 export class ComparisonService {
   private static instance: ComparisonService;
   private configs: ProviderConfigs;
   private services: {
-    openai: OpenAIService[];
-    anthropic: AnthropicService[];
     ollama: OllamaService[];
-    gguf: GGUFService[];
   };
 
   private constructor() {
     this.configs = {
-      openai: [],
-      anthropic: [],
-      google: [],
       ollama: [],
-      huggingface: [],
-      gguf: [],
     };
     this.services = {
-      openai: [],
-      anthropic: [],
       ollama: [],
-      gguf: [],
     };
   }
 
@@ -47,85 +36,139 @@ export class ComparisonService {
     
     // Reinitialize services with new configs
     this.services = {
-      openai: configs.openai
-        .filter(config => config.enabled)
-        .map(config => new OpenAIService(config)),
-      
-      anthropic: configs.anthropic
-        .filter(config => config.enabled)
-        .map(config => new AnthropicService(config)),
-      
       ollama: configs.ollama
         .filter(config => config.enabled)
         .map(config => new OllamaService(config)),
-      
-      gguf: configs.gguf
-        .filter(config => config.enabled)
-        .map(config => new GGUFService(config)),
     };
   }
 
-  public async compareModels(prompt: string): Promise<ComparisonResult> {
-    const start = Date.now();
-    const promises: Promise<ModelResponse>[] = [];
+  public async compareModels(prompt: string, options: { useStreaming?: boolean } = {}): Promise<ComparisonResult> {
+    const startTime = performance.now();
+    const activeConfigs = this.getActiveConfigs();
+    const results: ModelResponse[] = [];
+    const errors: string[] = [];
+    
+    // Default to streaming for real-time visualization
+    const useStreaming = options.useStreaming !== false;
+    
+    // Log the comparison request
+    browserLog('comparison-request', {
+      timestamp: new Date().toISOString(),
+      prompt: prompt.substring(0, 100) + (prompt.length > 100 ? '...' : ''),
+      modelCount: activeConfigs.ollama.length,
+      models: activeConfigs.ollama.map(c => c.modelName),
+      useStreaming
+    });
 
-    // Collect all enabled services
-    for (const service of this.services.openai) {
-      promises.push(service.generateResponse(prompt));
-    }
+    // Create a map to track progress for each model
+    const progressMap = new Map<string, (progress: number, metrics: ModelMetrics) => void>();
 
-    for (const service of this.services.anthropic) {
-      promises.push(service.generateResponse(prompt));
-    }
+    // Process Ollama models
+    const ollamaPromises = activeConfigs.ollama.map(async (config) => {
+      try {
+        // Create a progress callback for this model
+        const progressCallback = (progress: number, metrics: ModelMetrics) => {
+          // Dispatch progress event
+          const event = new CustomEvent('model-progress', {
+            detail: {
+              modelId: config.id,
+              progress,
+              metrics
+            }
+          });
+          window.dispatchEvent(event);
+        };
 
-    for (const service of this.services.ollama) {
-      promises.push(service.generateResponse(prompt));
-    }
+        // Store the progress callback
+        progressMap.set(config.id, progressCallback);
+        
+        // Find the service by ID
+        const serviceIndex = this.services.ollama.findIndex(s => {
+          // Access the ID through the public methods or create a new service
+          return s.getModelInfo(config.modelName)?.name === config.modelName;
+        });
+        
+        let service: OllamaService;
+        
+        if (serviceIndex === -1) {
+          // Create a new service if not found
+          service = new OllamaService(config);
+          this.services.ollama.push(service);
+        } else {
+          // Use the existing service
+          service = this.services.ollama[serviceIndex];
+        }
+        
+        // Generate completion with progress tracking
+        const metrics = await service.generateCompletion(prompt, progressCallback);
+        
+        // Create the response object
+        const response: ModelResponse = {
+          id: config.id,
+          provider: 'ollama',
+          model: config.modelName,
+          text: 'Response text will be available in the final result',
+          metrics
+        };
+        
+        // Send a final progress update with the accurate metrics
+        progressCallback(1, metrics);
+        
+        return response;
+      } catch (error) {
+        const errorMessage = `Error with model ${config.modelName}: ${error.message}`;
+        errors.push(errorMessage);
+        
+        // Create an error response
+        const errorResponse: ModelResponse = {
+          id: config.id,
+          provider: 'ollama',
+          model: config.modelName,
+          text: '',
+          metrics: {
+            responseTime: 0,
+            tokensPerSecond: 0,
+            totalTokens: 0,
+            promptTokens: 0,
+            completionTokens: 0
+          },
+          error: error.message
+        };
+        
+        return errorResponse;
+      }
+    });
 
-    for (const service of this.services.gguf) {
-      promises.push(service.generateResponse(prompt));
-    }
+    // Wait for all promises to resolve
+    const responses = await Promise.all(ollamaPromises);
+    results.push(...responses);
 
-    // Run all comparisons in parallel
-    const responses = await Promise.all(promises);
-    const end = Date.now();
+    const endTime = performance.now();
+    const totalTime = endTime - startTime;
 
-    // Collect errors
-    const errors = responses
-      .filter(response => response.error)
-      .map(response => `${response.provider} (${response.model}): ${response.error}`);
-
-    return {
+    // Create the final result
+    const result: ComparisonResult = {
       prompt,
       timestamp: new Date().toISOString(),
-      responses,
-      totalTime: end - start,
-      errors: errors.length > 0 ? errors : undefined,
+      responses: results,
+      totalTime,
+      errors: errors.length > 0 ? errors : undefined
     };
+
+    // Log the comparison result
+    browserLog('comparison-result', {
+      timestamp: new Date().toISOString(),
+      totalTime,
+      modelCount: results.length,
+      errorCount: errors.length,
+      models: results.map(r => r.model)
+    });
+
+    return result;
   }
 
   public async validateConnections(): Promise<Record<string, boolean>> {
     const results: Record<string, boolean> = {};
-
-    // Test OpenAI connections
-    for (const service of this.services.openai) {
-      try {
-        const response = await service.generateResponse("test");
-        results[`openai-${service['config'].id}`] = !response.error;
-      } catch {
-        results[`openai-${service['config'].id}`] = false;
-      }
-    }
-
-    // Test Anthropic connections
-    for (const service of this.services.anthropic) {
-      try {
-        const response = await service.generateResponse("test");
-        results[`anthropic-${service['config'].id}`] = !response.error;
-      } catch {
-        results[`anthropic-${service['config'].id}`] = false;
-      }
-    }
 
     // Test Ollama connections
     for (const service of this.services.ollama) {
@@ -134,16 +177,6 @@ export class ComparisonService {
         results[`ollama-${service['config'].id}`] = models.length > 0;
       } catch {
         results[`ollama-${service['config'].id}`] = false;
-      }
-    }
-
-    // Test GGUF connections
-    for (const service of this.services.gguf) {
-      try {
-        const isRunning = await service.isServerRunning();
-        results[`gguf-${service['config'].id}`] = isRunning;
-      } catch {
-        results[`gguf-${service['config'].id}`] = false;
       }
     }
 
@@ -171,6 +204,12 @@ export class ComparisonService {
     if (!service) {
       return false;
     }
-    return service.pullModel(modelName);
+    try {
+      await service.pullModel(modelName);
+      return true;
+    } catch (error) {
+      console.error("Error pulling model:", error);
+      return false;
+    }
   }
 } 

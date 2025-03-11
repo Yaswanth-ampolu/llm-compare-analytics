@@ -7,48 +7,16 @@ export interface BaseModelConfig {
   maxTokens?: number;
 }
 
-export interface APIEndpointConfig extends BaseModelConfig {
-  provider: 'openai' | 'anthropic' | 'google' | 'huggingface';
-  apiKey: string;
-  baseUrl?: string;  // Optional base URL override
-  modelName?: string;
-  organization?: string;  // For OpenAI org ID
-  projectId?: string;    // For OpenAI project ID
-  isProjectKey?: boolean; // Whether this is a project-scoped API key
-}
-
 export interface OllamaEndpointConfig extends BaseModelConfig {
   provider: 'ollama';
-  baseUrl: string;  // Required for Ollama
+  baseUrl: string;
   modelName: string;
   context_size?: number;
   threads?: number;
 }
 
-export interface GGUFModelConfig extends BaseModelConfig {
-  provider: 'gguf';
-  modelPath: string;
-  serverPort?: number;
-  context_size?: number;
-  threads?: number;
-}
-
 export interface ProviderConfigs {
-  openai: APIEndpointConfig[];
-  anthropic: APIEndpointConfig[];
-  google: APIEndpointConfig[];
   ollama: OllamaEndpointConfig[];
-  huggingface: APIEndpointConfig[];
-  gguf: GGUFModelConfig[];
-}
-
-export interface ModelCapabilities {
-  maxContextSize: number;
-  inputCostPer1k?: number;
-  outputCostPer1k?: number;
-  supportsStreaming: boolean;
-  supportsJsonMode?: boolean;
-  supportsFunctions?: boolean;
 }
 
 export interface ModelMetrics {
@@ -57,6 +25,7 @@ export interface ModelMetrics {
   totalTokens?: number;
   promptTokens?: number;
   completionTokens?: number;
+  processingTime?: number;
   cost?: number;
   contextSize?: number;
   memoryUsed?: number;

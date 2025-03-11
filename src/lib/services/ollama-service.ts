@@ -1,4 +1,5 @@
 import { OllamaEndpointConfig, ModelResponse, ModelMetrics } from '../types/model-config';
+import { browserLog, LoggableData } from '@/lib/utils/logger';
 
 interface OllamaResponse {
   model: string;
@@ -45,6 +46,11 @@ interface OllamaStats {
   prompt_eval_duration?: number;
   eval_count?: number;
   eval_duration?: number;
+}
+
+interface OllamaModelListItem {
+  name: string;
+  [key: string]: unknown;
 }
 
 export class OllamaService {
@@ -103,22 +109,90 @@ export class OllamaService {
   }
 
   private calculateMetrics(stats: OllamaStats, responseTime: number, text: string): ModelMetrics {
-    const completionTokens = this.estimateTokenCount(text);
-    const evalTokensPerSecond = stats.eval_count && stats.eval_duration
-      ? (stats.eval_count / (stats.eval_duration / 1000))
-      : completionTokens / (responseTime / 1000);
-
-    const modelInfo = this.modelInfo[this.config.modelName];
-    const contextSize = this.config.context_size || 4096; // Default context size
+    // Calculate tokens per second based on evaluation count and duration
+    let tokensPerSecond = 0;
+    let totalTokens = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let processingTime = 0;
+    
+    // Calculate processing time in seconds
+    if (stats.eval_duration !== undefined && stats.prompt_eval_duration !== undefined) {
+      // Convert nanoseconds to seconds
+      processingTime = (stats.eval_duration + stats.prompt_eval_duration) / 1e9;
+    } else {
+      // Fallback to response time if processing time is not available
+      processingTime = responseTime / 1000;
+    }
+    
+    // Calculate completion tokens
+    if (stats.eval_count !== undefined) {
+      completionTokens = stats.eval_count;
+    } else {
+      // Estimate completion tokens if not provided
+      completionTokens = this.estimateTokenCount(text);
+    }
+    
+    // Calculate prompt tokens - fix the negative tokens issue
+    if (stats.prompt_eval_count !== undefined) {
+      // In Ollama API, prompt_eval_count can sometimes be less than eval_count
+      // which would result in negative prompt tokens. This is a known issue.
+      if (stats.prompt_eval_count >= completionTokens) {
+        // Normal case: prompt_eval_count includes both prompt and completion
+        promptTokens = Math.max(0, stats.prompt_eval_count - completionTokens);
+        totalTokens = stats.prompt_eval_count; // This is already the total
+      } else {
+        // Abnormal case: prompt_eval_count is less than completion tokens
+        // In this case, use prompt_eval_count as prompt tokens and add to completion tokens
+        promptTokens = Math.max(0, stats.prompt_eval_count);
+        totalTokens = promptTokens + completionTokens;
+      }
+    } else {
+      // If no prompt tokens reported, estimate based on input
+      promptTokens = this.estimateTokenCount(text);
+      totalTokens = promptTokens + completionTokens;
+    }
+    
+    // Ensure we don't have negative prompt tokens
+    if (promptTokens < 0) promptTokens = 0;
+    
+    // Calculate tokens per second
+    if (processingTime > 0 && completionTokens > 0) {
+      // Focus on completion tokens per second as that's what users care about
+      tokensPerSecond = completionTokens / processingTime;
+    } else if (processingTime > 0 && totalTokens > 0) {
+      // Fallback to total tokens
+      tokensPerSecond = totalTokens / processingTime;
+    }
+    
+    // Ensure we don't return NaN or Infinity
+    if (!isFinite(tokensPerSecond)) {
+      tokensPerSecond = 0;
+    }
+    
+    // Log the calculation for debugging
+    browserLog(`metrics-calculation-${this.config.modelName}`, {
+      stats,
+      responseTime,
+      processingTime,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      tokensPerSecond,
+      textLength: text.length,
+      calculationMethod: stats.prompt_eval_count >= completionTokens ? 
+        "prompt_tokens_subtracted" : "prompt_tokens_direct"
+    });
 
     return {
       responseTime,
-      tokensPerSecond: evalTokensPerSecond,
-      totalTokens: stats.prompt_eval_count,
-      completionTokens: stats.eval_count,
-      promptTokens: stats.prompt_eval_count ? stats.prompt_eval_count - (stats.eval_count || 0) : undefined,
-      contextSize,
-      memoryUsed: stats.total_duration ? (stats.total_duration * 1024 * 1024) : undefined, // Rough memory usage estimation
+      tokensPerSecond,
+      totalTokens,
+      promptTokens,
+      completionTokens,
+      processingTime,
+      contextSize: this.config.context_size,
+      memoryUsed: undefined
     };
   }
 
@@ -130,52 +204,215 @@ export class OllamaService {
     return `/api/ollama/${endpoint}`;
   }
 
-  async generateCompletion(prompt: string) {
-    const startTime = performance.now();
-    
+  async generateCompletion(prompt: string, onProgress?: (progress: number, metrics: ModelMetrics) => void) {
     try {
+      const startTime = performance.now();
+      let totalTokens = 0;
+      let completionTokens = 0;
+      let promptTokens = 0;
+      let lastStats: OllamaStats = {};
+      let fullText = '';
+      let finalResponse: OllamaResponse | null = null;
+      
+      // Log the request
+      browserLog(`request-${this.config.modelName}`, {
+        timestamp: new Date().toISOString(),
+        model: this.config.modelName,
+        prompt: prompt.substring(0, 100) + (prompt.length > 100 ? '...' : ''),
+        config: {
+          ...this.config,
+          // Don't log the full prompt for privacy
+          prompt: undefined
+        }
+      });
+
       const response = await fetch(this.getApiUrl('generate'), {
-        method: "POST",
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
+          'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           model: this.config.modelName,
-          prompt: prompt,
-          stream: false,
+          prompt,
+          stream: true,
           options: {
             temperature: this.config.temperature || 0.7,
-            num_predict: this.config.maxTokens,
-            num_ctx: this.config.context_size,
-            num_thread: this.config.threads,
-          },
+            num_predict: this.config.maxTokens || 128,
+            ...(this.config.context_size ? { num_ctx: this.config.context_size } : {}),
+            ...(this.config.threads ? { num_thread: this.config.threads } : {})
+          }
         }),
       });
 
       if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: response.statusText }));
-        throw new Error(error.error || 'Ollama API error');
+        const errorText = await response.text();
+        browserLog(`error-${this.config.modelName}`, {
+          timestamp: new Date().toISOString(),
+          status: response.status,
+          statusText: response.statusText,
+          error: errorText
+        });
+        throw new Error(`Ollama API error: ${response.status} ${response.statusText} - ${errorText}`);
       }
 
-      const data: OllamaResponse = await response.json();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n').filter(Boolean);
+
+        for (const line of lines) {
+          try {
+            const data: OllamaResponse = JSON.parse(line);
+            fullText += data.response;
+            
+            // Store the final response for accurate metrics calculation
+            if (data.done) {
+              finalResponse = data;
+            }
+            
+            // Update stats
+            if (data.eval_count) {
+              const now = performance.now();
+              const timeSinceLastUpdate = (now - startTime) / 1000; // Convert to seconds
+              
+              completionTokens = data.eval_count;
+              
+              // Fix for negative prompt tokens
+              if (data.prompt_eval_count >= data.eval_count) {
+                promptTokens = Math.max(0, data.prompt_eval_count - data.eval_count);
+                totalTokens = data.prompt_eval_count;
+              } else {
+                // Handle the case where prompt_eval_count is less than eval_count
+                promptTokens = Math.max(0, data.prompt_eval_count);
+                totalTokens = promptTokens + completionTokens;
+              }
+              
+              lastStats = {
+                total_duration: data.total_duration,
+                eval_count: data.eval_count,
+                eval_duration: data.eval_duration,
+                prompt_eval_count: data.prompt_eval_count,
+                prompt_eval_duration: data.prompt_eval_duration
+              };
+
+              // Calculate and report progress with current metrics
+              if (onProgress) {
+                const metrics = {
+                  responseTime: timeSinceLastUpdate * 1000, // Convert to milliseconds
+                  tokensPerSecond: completionTokens / (data.eval_duration / 1e9 || timeSinceLastUpdate),
+                  totalTokens,
+                  promptTokens,
+                  completionTokens,
+                  processingTime: data.total_duration / 1e9
+                };
+                
+                // Calculate progress more accurately
+                const progress = data.eval_count / (this.config.maxTokens || 128);
+                onProgress(Math.min(progress, 0.99), metrics);
+              }
+            }
+          } catch (e) {
+            console.warn('Error parsing streaming response:', e);
+          }
+        }
+      }
+
       const endTime = performance.now();
       
-      // Calculate metrics from the Ollama response
-      const responseTime = data.total_duration / 1e6; // Convert nanoseconds to milliseconds
-      const totalTokens = data.prompt_eval_count + data.eval_count;
-      const totalProcessingTime = (data.prompt_eval_duration + data.eval_duration) / 1e9; // Convert nanoseconds to seconds
-      const tokensPerSecond = totalTokens / totalProcessingTime;
+      // Use the final response for accurate metrics if available
+      if (finalResponse) {
+        // Calculate accurate metrics from the final response
+        const responseTime = finalResponse.total_duration / 1e6; // Convert to milliseconds
+        
+        // Calculate prompt tokens accurately
+        promptTokens = Math.max(0, finalResponse.prompt_eval_count - finalResponse.eval_count);
+        completionTokens = finalResponse.eval_count;
+        totalTokens = promptTokens + completionTokens;
+        
+        // Calculate processing time in seconds
+        const processingTime = finalResponse.total_duration / 1e9;
+        
+        // Calculate tokens per second based on completion tokens and eval_duration
+        const tokensPerSecond = completionTokens / (finalResponse.eval_duration / 1e9);
+        
+        // Create final metrics
+        const finalMetrics = {
+          responseTime,
+          tokensPerSecond: isFinite(tokensPerSecond) ? tokensPerSecond : 0,
+          totalTokens,
+          promptTokens,
+          completionTokens,
+          processingTime,
+          contextSize: this.config.context_size
+        };
+        
+        // Log final metrics
+        browserLog(`completion-${this.config.modelName}`, {
+          timestamp: new Date().toISOString(),
+          model: this.config.modelName,
+          ...finalMetrics,
+          rawStats: finalResponse
+        });
+        
+        if (onProgress) {
+          onProgress(1, finalMetrics);
+        }
+        
+        return finalMetrics;
+      } else {
+        // Fallback to the last stats if no final response
+        const responseTime = lastStats.total_duration ? lastStats.total_duration / 1e6 : endTime - startTime;
+        const totalProcessingTime = (lastStats.prompt_eval_duration + lastStats.eval_duration) / 1e9 || (endTime - startTime) / 1000;
+        
+        // Ensure non-negative prompt tokens in final metrics
+        if (promptTokens < 0) promptTokens = 0;
+        
+        // Recalculate total tokens to ensure consistency
+        totalTokens = promptTokens + completionTokens;
+        
+        const tokensPerSecond = completionTokens / (lastStats.eval_duration / 1e9 || totalProcessingTime);
 
-      return {
+        // Signal completion with final metrics
+        const finalMetrics = {
         responseTime,
-        tokensPerSecond,
+          tokensPerSecond: isFinite(tokensPerSecond) ? tokensPerSecond : 0,
         totalTokens,
-        promptTokens: data.prompt_eval_count,
-        completionTokens: data.eval_count,
+          promptTokens,
+          completionTokens,
         processingTime: totalProcessingTime,
-      };
+          contextSize: this.config.context_size
+        };
+        
+        // Log final metrics
+        browserLog(`completion-${this.config.modelName}`, {
+          timestamp: new Date().toISOString(),
+          model: this.config.modelName,
+          ...finalMetrics,
+          rawStats: lastStats
+        });
+
+        if (onProgress) {
+          onProgress(1, finalMetrics);
+        }
+
+        return finalMetrics;
+      }
     } catch (error) {
       console.error("Error generating Ollama completion:", error);
+      
+      // Log the error
+      browserLog(`error-${this.config.modelName}`, {
+        timestamp: new Date().toISOString(),
+        model: this.config.modelName,
+        error: error.message,
+        stack: error.stack
+      });
+      
       throw error;
     }
   }
@@ -194,7 +431,7 @@ export class OllamaService {
       }
 
       const data = await response.json();
-      return data.models?.map((model: any) => model.name) || [];
+      return data.models?.map((model: OllamaModelListItem) => model.name) || [];
     } catch (error) {
       console.error("Error listing Ollama models:", error);
       return []; // Return empty array instead of throwing

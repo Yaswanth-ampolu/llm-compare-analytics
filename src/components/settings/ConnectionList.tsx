@@ -1,162 +1,140 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Plus, Edit, Trash2 } from "lucide-react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Badge } from "@/components/ui/badge";
-import { Switch } from "@/components/ui/switch";
-import { BaseModelConfig } from "@/lib/types/model-config";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { OllamaConnectionForm } from "./OllamaConnectionForm";
+import { OllamaEndpointConfig } from "@/lib/types/model-config";
+import { ModelSettings } from "@/lib/model-service";
 
-interface ConnectionListProps<T extends BaseModelConfig> {
-  title: string;
-  description: string;
-  connections: T[];
-  onAdd: (config: T) => void;
-  onEdit: (connection: T) => void;
-  onDelete: (id: string) => void;
-  onToggle: (id: string, enabled: boolean) => void;
-  renderConnectionInfo: (connection: T) => React.ReactNode;
-  renderEditForm: (props: { 
-    connection?: T; 
-    onCancel: () => void; 
-    onSubmit: (config: T) => void;
-  }) => React.ReactNode;
+interface ConnectionListProps {
+  settings: ModelSettings;
+  onSave: (settings: ModelSettings) => void;
 }
 
-const ConnectionList = <T extends BaseModelConfig>({
-  title,
-  description,
-  connections,
-  onAdd,
-  onEdit,
-  onDelete,
-  onToggle,
-  renderConnectionInfo,
-  renderEditForm,
-}: ConnectionListProps<T>) => {
-  const [editingConnection, setEditingConnection] = useState<T | undefined>();
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
+export function ConnectionList({ settings, onSave }: ConnectionListProps) {
+  const [activeTab, setActiveTab] = useState<string>("ollama");
+  const [editingConnection, setEditingConnection] = useState<OllamaEndpointConfig | null>(null);
+  const [isAddingNew, setIsAddingNew] = useState(false);
 
-  const handleEdit = (connection: T) => {
-    setEditingConnection(connection);
-    setIsDialogOpen(true);
-  };
-
-  const handleAdd = () => {
-    setEditingConnection(undefined);
-    setIsDialogOpen(true);
-  };
-
-  const handleClose = () => {
-    setEditingConnection(undefined);
-    setIsDialogOpen(false);
-  };
-
-  const handleSubmit = (config: T) => {
-    if (editingConnection) {
-      onEdit(config);
-    } else {
-      onAdd(config);
+  const handleSaveConnection = (config: OllamaEndpointConfig) => {
+    const newSettings = { ...settings };
+    
+    // Update Ollama connections
+    if (config.provider === "ollama") {
+      newSettings.ollama = {
+        ...newSettings.ollama,
+        [config.id]: config
+      };
     }
-    handleClose();
+    
+    onSave(newSettings);
+    setEditingConnection(null);
+    setIsAddingNew(false);
+  };
+
+  const handleDeleteConnection = (id: string, provider: string) => {
+    const newSettings = { ...settings };
+    
+    if (provider === "ollama") {
+      const { [id]: _, ...rest } = newSettings.ollama;
+      newSettings.ollama = rest;
+    }
+    
+    onSave(newSettings);
+  };
+
+  const handleAddNew = () => {
+    setIsAddingNew(true);
+    
+    // Create a new connection based on the active tab
+    if (activeTab === "ollama") {
+      setEditingConnection({
+        id: `ollama-${Date.now()}`,
+        name: "New Ollama Connection",
+        enabled: true,
+        provider: "ollama",
+        baseUrl: "http://localhost:11434",
+        modelName: "llama2"
+      });
+    }
+  };
+
+  const renderConnectionList = () => {
+    if (isAddingNew || editingConnection) {
+      if (activeTab === "ollama" && editingConnection?.provider === "ollama") {
+        return (
+          <OllamaConnectionForm
+            connection={editingConnection}
+            onSubmit={handleSaveConnection}
+            onCancel={() => {
+              setEditingConnection(null);
+              setIsAddingNew(false);
+            }}
+          />
+        );
+      }
+      return null;
+    }
+
+    return (
+      <>
+        <TabsContent value="ollama" className="space-y-4">
+          {Object.values(settings.ollama || {}).map((connection) => (
+            <Card key={connection.id} className="relative">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-lg flex justify-between">
+                  <span>{connection.name}</span>
+                  <div className="space-x-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setEditingConnection(connection as OllamaEndpointConfig)}
+                    >
+                      Edit
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleDeleteConnection(connection.id, "ollama")}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-sm text-muted-foreground">
+                  <div>URL: {connection.baseUrl}</div>
+                  <div>Model: {connection.modelName}</div>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+          {Object.keys(settings.ollama || {}).length === 0 && (
+            <div className="text-center py-8 text-muted-foreground">
+              No Ollama connections configured
+            </div>
+          )}
+        </TabsContent>
+      </>
+    );
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <div>
-            <CardTitle>{title}</CardTitle>
-            <CardDescription>{description}</CardDescription>
-          </div>
-          <Button onClick={handleAdd} size="sm">
-            <Plus className="h-4 w-4 mr-2" />
-            Add Connection
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
-          {connections.map((connection) => (
-            <div
-              key={connection.id}
-              className="flex items-center justify-between p-4 border rounded-lg"
-            >
-              <div className="flex items-center space-x-4">
-                <Switch
-                  checked={connection.enabled}
-                  onCheckedChange={(checked) => onToggle(connection.id, checked)}
-                />
-                <div>
-                  <div className="font-medium flex items-center space-x-2">
-                    <span>{connection.name}</span>
-                    <Badge variant={connection.enabled ? "default" : "secondary"}>
-                      {connection.enabled ? "Active" : "Disabled"}
-                    </Badge>
-                  </div>
-                  <div className="text-sm text-muted-foreground">
-                    {renderConnectionInfo(connection)}
-                  </div>
-                </div>
-              </div>
-              <div className="flex items-center space-x-2">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => handleEdit(connection)}
-                >
-                  <Edit className="h-4 w-4" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => onDelete(connection.id)}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          ))}
+    <div className="space-y-4">
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold">Model Connections</h2>
+        {!isAddingNew && !editingConnection && (
+          <Button onClick={handleAddNew}>Add Connection</Button>
+        )}
+      </div>
 
-          {connections.length === 0 && (
-            <div className="text-center p-4 text-muted-foreground">
-              No connections configured. Click "Add Connection" to get started.
-            </div>
-          )}
-        </div>
-      </CardContent>
-
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {editingConnection ? "Edit Connection" : "Add New Connection"}
-            </DialogTitle>
-            <DialogDescription>
-              Configure your connection settings below.
-            </DialogDescription>
-          </DialogHeader>
-          {renderEditForm({
-            connection: editingConnection,
-            onCancel: handleClose,
-            onSubmit: handleSubmit
-          })}
-        </DialogContent>
-      </Dialog>
-    </Card>
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+        <TabsList className="grid w-full grid-cols-1">
+          <TabsTrigger value="ollama">Ollama</TabsTrigger>
+        </TabsList>
+        {renderConnectionList()}
+      </Tabs>
+    </div>
   );
-};
-
-export { ConnectionList }; 
+} 
